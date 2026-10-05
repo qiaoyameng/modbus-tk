@@ -463,7 +463,7 @@ class Slave(object):
     asked by a modbus query
     """
 
-    def __init__(self, slave_id, unsigned=True, memory=None):
+    def __init__(self, slave_id, unsigned=True, memory=None, allow_cross_block_access=False):
         """Constructor"""
         self._id = slave_id
 
@@ -482,6 +482,7 @@ class Slave(object):
             }
         else:
             self._memory = memory
+        self.allow_cross_block_access = allow_cross_block_access
         # a lock for mutual access to the _blocks and _memory maps
         self._data_lock = threading.RLock()
         # map modbus function code to a function:
@@ -508,6 +509,66 @@ class Slave(object):
                     return block, offset
         raise ModbusError(defines.ILLEGAL_DATA_ADDRESS)
 
+    def _get_block_segments(self, block_type, address, length):
+        """Return the consecutive block segments covered by an address range"""
+        if not self.allow_cross_block_access:
+            block, offset = self._get_block_and_offset(block_type, address, length)
+            return [(block, offset, length)]
+
+        blocks = sorted(self._memory[block_type], key=lambda block: block.starting_address)
+        start_index = -1
+        for index, block in enumerate(blocks):
+            block_end = block.starting_address + block.size
+            if block.starting_address <= address < block_end:
+                start_index = index
+                break
+
+        if start_index < 0:
+            raise ModbusError(defines.ILLEGAL_DATA_ADDRESS)
+
+        segments = []
+        current_address = address
+        remaining = length
+        index = start_index
+
+        while remaining > 0:
+            if index >= len(blocks):
+                raise ModbusError(defines.ILLEGAL_DATA_ADDRESS)
+
+            block = blocks[index]
+            block_end = block.starting_address + block.size
+            if current_address < block.starting_address or current_address >= block_end:
+                raise ModbusError(defines.ILLEGAL_DATA_ADDRESS)
+
+            offset = current_address - block.starting_address
+            segment_size = min(remaining, block_end - current_address)
+            segments.append((block, offset, segment_size))
+
+            remaining -= segment_size
+            current_address += segment_size
+            index += 1
+
+            if remaining > 0 and (index >= len(blocks) or blocks[index].starting_address != current_address):
+                raise ModbusError(defines.ILLEGAL_DATA_ADDRESS)
+
+        return segments
+
+    def _get_segment_values(self, segments):
+        """Read values from one or more consecutive block segments"""
+        values = []
+        for block, offset, size in segments:
+            values.extend(block[offset:offset+size])
+        return values
+
+    def _set_segment_values(self, block_type, address, values):
+        """Write values after validating that the whole range is covered"""
+        segments = self._get_block_segments(block_type, address, len(values))
+        value_offset = 0
+        for block, offset, size in segments:
+            for i in range(size):
+                block[offset+i] = values[value_offset+i]
+            value_offset += size
+
     def _read_digital(self, block_type, request_pdu):
         """read the value of coils and discrete inputs"""
         (starting_address, quantity_of_x) = struct.unpack(">HH", request_pdu[1:5])
@@ -516,9 +577,8 @@ class Slave(object):
             # maximum allowed size is 2000 bits in one reading
             raise ModbusError(defines.ILLEGAL_DATA_VALUE)
 
-        block, offset = self._get_block_and_offset(block_type, starting_address, quantity_of_x)
-
-        values = block[offset:offset+quantity_of_x]
+        segments = self._get_block_segments(block_type, starting_address, quantity_of_x)
+        values = self._get_segment_values(segments)
 
         # pack bits in bytes
         byte_count = quantity_of_x // 8
@@ -565,11 +625,8 @@ class Slave(object):
             LOGGER.debug("quantity_of_x is %d", quantity_of_x)
             raise ModbusError(defines.ILLEGAL_DATA_VALUE)
 
-        # look for the block corresponding to the request
-        block, offset = self._get_block_and_offset(block_type, starting_address, quantity_of_x)
-
-        # get the values
-        values = block[offset:offset+quantity_of_x]
+        segments = self._get_block_segments(block_type, starting_address, quantity_of_x)
+        values = self._get_segment_values(segments)
 
         # write the response header
         response = struct.pack(">B", 2 * quantity_of_x)
@@ -607,11 +664,10 @@ class Slave(object):
             LOGGER.debug("quantity_of_x_to_read is %d", quantity_of_x_to_read)
             raise ModbusError(defines.ILLEGAL_DATA_VALUE)
 
-        # look for the block corresponding to the request
-        block, offset = self._get_block_and_offset(defines.HOLDING_REGISTERS, starting_read_address, quantity_of_x_to_read)
-
-        # get the values
-        values = block[offset:offset+quantity_of_x_to_read]
+        read_segments = self._get_block_segments(
+            defines.HOLDING_REGISTERS, starting_read_address, quantity_of_x_to_read
+        )
+        values = self._get_segment_values(read_segments)
         # write the response header
         response = struct.pack(">B", 2 * quantity_of_x_to_read)
         # add the values of every register on 2 bytes
@@ -624,14 +680,14 @@ class Slave(object):
             # maximum allowed size is 123 registers in one reading
             raise ModbusError(defines.ILLEGAL_DATA_VALUE)
 
-        # look for the block corresponding to the request
-        block, offset = self._get_block_and_offset(defines.HOLDING_REGISTERS, starting_write_address, quantity_of_x_to_write)
+        if len(request_pdu) != 10 + byte_count_to_write:
+            raise ModbusError(defines.ILLEGAL_DATA_VALUE)
 
-        count = 0
+        write_values = []
         for i in range(quantity_of_x_to_write):
-            count += 1
             fmt = "H" if self.unsigned else "h"
-            block[offset+i] = struct.unpack(">"+fmt, request_pdu[10+2*i:12+2*i])[0]
+            write_values.append(struct.unpack(">"+fmt, request_pdu[10+2*i:12+2*i])[0])
+        self._set_segment_values(defines.HOLDING_REGISTERS, starting_write_address, write_values)
 
         return response
 
@@ -641,7 +697,7 @@ class Slave(object):
 
         (data_address, and_mask, or_mask) = struct.unpack(">HHH", request_pdu[1:7])
         # look for the block corresponding to the request
-        block, offset = self._get_block_and_offset(defines.HOLDING_REGISTERS, data_address, 1)
+        block, offset, _ = self._get_block_segments(defines.HOLDING_REGISTERS, data_address, 1)[0]
         block[offset] = (block[offset] & and_mask) | (or_mask & ~and_mask)
         # returns echo of the command
         return request_pdu[1:]
@@ -656,16 +712,16 @@ class Slave(object):
             # maximum allowed size is 123 registers in one reading
             raise ModbusError(defines.ILLEGAL_DATA_VALUE)
 
-        # look for the block corresponding to the request
-        block, offset = self._get_block_and_offset(defines.HOLDING_REGISTERS, starting_address, quantity_of_x)
+        if len(request_pdu) != 6 + byte_count:
+            raise ModbusError(defines.ILLEGAL_DATA_VALUE)
 
-        count = 0
+        values = []
         for i in range(quantity_of_x):
-            count += 1
             fmt = "H" if self.unsigned else "h"
-            block[offset+i] = struct.unpack(">"+fmt, request_pdu[6+2*i:8+2*i])[0]
+            values.append(struct.unpack(">"+fmt, request_pdu[6+2*i:8+2*i])[0])
 
-        return struct.pack(">HH", starting_address, count)
+        self._set_segment_values(defines.HOLDING_REGISTERS, starting_address, values)
+        return struct.pack(">HH", starting_address, quantity_of_x)
 
     def _write_multiple_coils(self, request_pdu):
         """execute modbus function 15"""
@@ -681,26 +737,24 @@ class Slave(object):
             # maximum allowed size is 1968 coils
             raise ModbusError(defines.ILLEGAL_DATA_VALUE)
 
-        # look for the block corresponding to the request
-        block, offset = self._get_block_and_offset(defines.COILS, starting_address, quantity_of_x)
+        if len(request_pdu) != 6 + byte_count:
+            raise ModbusError(defines.ILLEGAL_DATA_VALUE)
 
-        count = 0
+        segments = self._get_block_segments(defines.COILS, starting_address, quantity_of_x)
+        values = [0] * quantity_of_x
+
         for i in range(byte_count):
-            if count >= quantity_of_x:
-                break
             fmt = "B" if self.unsigned else "b"
             (byte_value, ) = struct.unpack(">"+fmt, request_pdu[6+i:7+i])
             for j in range(8):
-                if count >= quantity_of_x:
+                index = i*8+j
+                if index >= quantity_of_x:
                     break
 
-                if byte_value & (1 << j):
-                    block[offset+i*8+j] = 1
-                else:
-                    block[offset+i*8+j] = 0
+                values[index] = 1 if byte_value & (1 << j) else 0
 
-                count += 1
-        return struct.pack(">HH", starting_address, count)
+        self._set_segment_values(defines.COILS, starting_address, values)
+        return struct.pack(">HH", starting_address, quantity_of_x)
 
     def _write_single_register(self, request_pdu):
         """execute modbus function 6"""
@@ -708,7 +762,7 @@ class Slave(object):
 
         fmt = "H" if self.unsigned else "h"
         (data_address, value) = struct.unpack(">H"+fmt, request_pdu[1:5])
-        block, offset = self._get_block_and_offset(defines.HOLDING_REGISTERS, data_address, 1)
+        block, offset, _ = self._get_block_segments(defines.HOLDING_REGISTERS, data_address, 1)[0]
         block[offset] = value
         # returns echo of the command
         return request_pdu[1:]
@@ -718,7 +772,7 @@ class Slave(object):
 
         call_hooks("modbus.Slave.handle_write_single_coil_request", (self, request_pdu))
         (data_address, value) = struct.unpack(">HH", request_pdu[1:5])
-        block, offset = self._get_block_and_offset(defines.COILS, data_address, 1)
+        block, offset, _ = self._get_block_segments(defines.COILS, data_address, 1)[0]
         if value == 0:
             block[offset] = 0
         elif value == 0xff00:
@@ -905,13 +959,15 @@ class Databank(object):
         self._lock = threading.RLock()
         self.error_on_missing_slave = error_on_missing_slave
 
-    def add_slave(self, slave_id, unsigned=True, memory=None):
+    def add_slave(self, slave_id, unsigned=True, memory=None, allow_cross_block_access=False):
         """Add a new slave with the given id"""
         with self._lock:
             if (slave_id <= 0) or (slave_id > 255):
                 raise Exception("Invalid slave id {0}".format(slave_id))
             if slave_id not in self._slaves:
-                self._slaves[slave_id] = Slave(slave_id, unsigned, memory)
+                self._slaves[slave_id] = Slave(
+                    slave_id, unsigned, memory, allow_cross_block_access=allow_cross_block_access
+                )
                 return self._slaves[slave_id]
             else:
                 raise DuplicatedKeyError("Slave {0} already exists".format(slave_id))
@@ -1025,9 +1081,11 @@ class Server(object):
         """returns the databank"""
         return self._databank
 
-    def add_slave(self, slave_id, unsigned=True, memory=None):
+    def add_slave(self, slave_id, unsigned=True, memory=None, allow_cross_block_access=False):
         """add slave to the server"""
-        return self._databank.add_slave(slave_id, unsigned, memory)
+        return self._databank.add_slave(
+            slave_id, unsigned, memory, allow_cross_block_access=allow_cross_block_access
+        )
 
     def get_slave(self, slave_id):
         """get the slave with the given id"""
