@@ -43,6 +43,35 @@ Features
 * logging capability through python logging module
 * Web-based HMI (experimental feature which requires bottle)
 
+Offline RTU replay
+------------------------------------
+When the only evidence from a failed serial link is a log of
+(timestamp, bytes) pairs, `modbus_tk.rtu_replay` rebuilds the RTU frames
+without any serial hardware and without sleeping: timestamps are injected by
+the caller, in microseconds, as integers or exact rational values
+(`fractions.Fraction`).
+
+The replayer applies the specification timing rules: a silence of at least
+3.5 character times (t3.5) closes a frame; a gap of more than 1.5 character
+times (t1.5) aborts the partial frame; above 19200 baud the fixed limits of
+1750 us and 750 us are used. It emits distinguishable events for valid frames
+(including broadcast and exception responses), CRC errors, interrupted frames,
+malformed frames, and the un-terminated tail reported by the mandatory final
+flush.
+
+```python
+from modbus_tk.rtu_replay import replay, Arrival
+
+events = replay(
+    [Arrival(0, first_frame), Arrival(2000, second_frame)],
+    baudrate=115200, end_timestamp_us=4000
+)
+for event in events:
+    print(event.event_type, event)
+```
+
+See `examples/rtu_replay_example.py` for a complete example.
+
 Feedback
 ------------------------------------
 Feedback is welcomed! Please enter an issue for giving your feedback.
