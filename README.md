@@ -43,6 +43,25 @@ Features
 * logging capability through python logging module
 * Web-based HMI (experimental feature which requires bottle)
 
+Offline RTU frame replay
+------------------------------------
+When the serial hardware is unavailable but a "timestamp + byte" capture is,
+`modbus_tk.rtu_replay` splits the stream into RTU frames deterministically:
+
+```python
+from modbus_tk.rtu_replay import replay
+
+# (timestamp_us, byte) arrival events; timestamps may also be fractions.Fraction
+events = [(0, 0x01), (100, 0x03), ...]
+for event in replay(events, baudrate=115200, end_time=12000):
+    print(event.kind, bytes(event.data).hex())
+```
+
+It enforces the t1.5 intra-frame and t3.5 inter-frame timers (750/1750 us above
+19200 bps), never sleeps, and emits distinct events for valid frames (including
+broadcast and exception responses), CRC errors, mid-frame interruptions and
+truncated tails left without a closing silence.
+
 Feedback
 ------------------------------------
 Feedback is welcomed! Please enter an issue for giving your feedback.
