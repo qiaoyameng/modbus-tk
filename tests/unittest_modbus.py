@@ -173,6 +173,186 @@ class TestSlaveRequestHandler(unittest.TestCase):
         """
         self._read_continuous_blocks(modbus_tk.defines.READ_INPUT_REGISTERS, modbus_tk.defines.ANALOG_INPUTS)
 
+    def testHandleReadCoilsOnAdjacentBlocks(self):
+        """read a non byte-aligned coil range shared by adjacent blocks"""
+        slave = modbus_tk.modbus.Slave(0, allow_adjacent_blocks=True)
+        slave.add_block("coils-0", modbus_tk.defines.COILS, 0, 5)
+        slave.add_block("coils-1", modbus_tk.defines.COILS, 5, 10)
+        slave.set_values("coils-0", 0, [0, 0, 1, 0, 1])
+        slave.set_values("coils-1", 5, [1, 0, 0, 1, 1, 0, 1, 0, 0, 0])
+
+        response = slave.handle_request(struct.pack(
+            ">BHH", modbus_tk.defines.READ_COILS, 2, 11
+        ))
+
+        self.assertEqual(
+            struct.pack(">BBBB", modbus_tk.defines.READ_COILS, 2, 0xcd, 0x02),
+            response
+        )
+
+    def testHandleWriteCoilsAcrossAdjacentBlocks(self):
+        """write a non byte-aligned coil range shared by adjacent blocks"""
+        slave = modbus_tk.modbus.Slave(0, allow_adjacent_blocks=True)
+        slave.add_block("coils-0", modbus_tk.defines.COILS, 0, 5)
+        slave.add_block("coils-1", modbus_tk.defines.COILS, 5, 10)
+
+        response = slave.handle_request(struct.pack(
+            ">BHHBBB", modbus_tk.defines.WRITE_MULTIPLE_COILS, 2, 11, 2, 0xcd, 0x02
+        ))
+
+        self.assertEqual(
+            struct.pack(">BHH", modbus_tk.defines.WRITE_MULTIPLE_COILS, 2, 11),
+            response
+        )
+        self.assertEqual(slave.get_values("coils-0", 0, 5), (0, 0, 1, 0, 1))
+        self.assertEqual(slave.get_values("coils-1", 5, 10), (1, 0, 0, 1, 1, 0, 1, 0, 0, 0))
+
+    def testHandleRejectCoilsWithGap(self):
+        """reject a coil range when adjacent block access crosses a gap"""
+        slave = modbus_tk.modbus.Slave(0, allow_adjacent_blocks=True)
+        slave.add_block("coils-0", modbus_tk.defines.COILS, 0, 5)
+        slave.add_block("coils-1", modbus_tk.defines.COILS, 6, 10)
+
+        response = slave.handle_request(struct.pack(
+            ">BHH", modbus_tk.defines.READ_COILS, 0, 12
+        ))
+
+        self.assertEqual(response, struct.pack(
+            ">BB", modbus_tk.defines.READ_COILS + 128, modbus_tk.defines.ILLEGAL_DATA_ADDRESS
+        ))
+
+    def testHandleRejectCoilsOutsideAddressSpace(self):
+        """reject a coil range which ends beyond the Modbus address space"""
+        slave = modbus_tk.modbus.Slave(0, allow_adjacent_blocks=True)
+        slave.add_block("coils", modbus_tk.defines.COILS, 65535, 1)
+
+        response = slave.handle_request(struct.pack(
+            ">BHH", modbus_tk.defines.READ_COILS, 65535, 2
+        ))
+
+        self.assertEqual(response, struct.pack(
+            ">BB", modbus_tk.defines.READ_COILS + 128, modbus_tk.defines.ILLEGAL_DATA_ADDRESS
+        ))
+
+    def testHandleWriteCoilsDoesNotPartiallyCommitInvalidRange(self):
+        """validate the complete coil range before committing any block"""
+        slave = modbus_tk.modbus.Slave(0, allow_adjacent_blocks=True)
+        slave.add_block("coils-0", modbus_tk.defines.COILS, 0, 5)
+        slave.add_block("coils-1", modbus_tk.defines.COILS, 5, 10)
+        slave.add_block("coils-2", modbus_tk.defines.HOLDING_REGISTERS, 15, 5)
+        slave.set_values("coils-0", 0, [0] * 5)
+        slave.set_values("coils-1", 5, [1] * 10)
+
+        response = slave.handle_request(struct.pack(
+            ">BHHBHH", modbus_tk.defines.WRITE_MULTIPLE_COILS, 5, 16, 2, 0xffff, 0
+        ))
+
+        self.assertEqual(response, struct.pack(
+            ">BB", modbus_tk.defines.WRITE_MULTIPLE_COILS + 128, modbus_tk.defines.ILLEGAL_DATA_ADDRESS
+        ))
+        self.assertEqual(slave.get_values("coils-0", 0, 5), (0, ) * 5)
+        self.assertEqual(slave.get_values("coils-1", 5, 10), (1, ) * 10)
+
+    def testHandleRejectAdjacentCoilsOfDifferentTypeInSharedMemory(self):
+        """reject adjacent block access when the next block has another type"""
+        shared_blocks = []
+        slave = modbus_tk.modbus.Slave(0, True, {
+            modbus_tk.defines.COILS: shared_blocks,
+            modbus_tk.defines.DISCRETE_INPUTS: shared_blocks,
+            modbus_tk.defines.HOLDING_REGISTERS: shared_blocks,
+            modbus_tk.defines.ANALOG_INPUTS: shared_blocks,
+        }, allow_adjacent_blocks=True)
+        slave.add_block("coils", modbus_tk.defines.COILS, 0, 5)
+        slave.add_block("registers", modbus_tk.defines.HOLDING_REGISTERS, 5, 5)
+
+        response = slave.handle_request(struct.pack(
+            ">BHH", modbus_tk.defines.READ_COILS, 0, 6
+        ))
+
+        self.assertEqual(response, struct.pack(
+            ">BB", modbus_tk.defines.READ_COILS + 128, modbus_tk.defines.ILLEGAL_DATA_ADDRESS
+        ))
+
+    def testHandleReadHoldingRegistersOnAdjacentBlocks(self):
+        """read a register range shared by adjacent blocks"""
+        slave = modbus_tk.modbus.Slave(0, allow_adjacent_blocks=True)
+        slave.add_block("hr-0", modbus_tk.defines.HOLDING_REGISTERS, 0, 3)
+        slave.add_block("hr-1", modbus_tk.defines.HOLDING_REGISTERS, 3, 4)
+        slave.set_values("hr-0", 0, (11, 12, 13))
+        slave.set_values("hr-1", 3, (21, 22, 23, 24))
+
+        response = slave.handle_request(struct.pack(
+            ">BHH", modbus_tk.defines.READ_HOLDING_REGISTERS, 1, 5
+        ))
+
+        self.assertEqual(response, struct.pack(
+            ">BBHHHHH", modbus_tk.defines.READ_HOLDING_REGISTERS, 10, 12, 13, 21, 22, 23
+        ))
+
+    def testHandleWriteHoldingRegistersAcrossAdjacentBlocks(self):
+        """write a register range shared by adjacent blocks"""
+        slave = modbus_tk.modbus.Slave(0, allow_adjacent_blocks=True)
+        slave.add_block("hr-0", modbus_tk.defines.HOLDING_REGISTERS, 0, 3)
+        slave.add_block("hr-1", modbus_tk.defines.HOLDING_REGISTERS, 3, 4)
+
+        response = slave.handle_request(struct.pack(
+            ">BHHBHHHH", modbus_tk.defines.WRITE_MULTIPLE_REGISTERS,
+            1, 4, 8, 12, 13, 21, 22
+        ))
+
+        self.assertEqual(response, struct.pack(
+            ">BHH", modbus_tk.defines.WRITE_MULTIPLE_REGISTERS, 1, 4
+        ))
+        self.assertEqual(slave.get_values("hr-0", 0, 3), (0, 12, 13))
+        self.assertEqual(slave.get_values("hr-1", 3, 4), (21, 22, 0, 0))
+
+    def testHandleRejectHoldingRegistersWithGap(self):
+        """reject a register range when adjacent block access crosses a gap"""
+        slave = modbus_tk.modbus.Slave(0, allow_adjacent_blocks=True)
+        slave.add_block("hr-0", modbus_tk.defines.HOLDING_REGISTERS, 0, 3)
+        slave.add_block("hr-1", modbus_tk.defines.HOLDING_REGISTERS, 4, 4)
+
+        response = slave.handle_request(struct.pack(
+            ">BHH", modbus_tk.defines.READ_HOLDING_REGISTERS, 0, 4
+        ))
+
+        self.assertEqual(response, struct.pack(
+            ">BB", modbus_tk.defines.READ_HOLDING_REGISTERS + 128, modbus_tk.defines.ILLEGAL_DATA_ADDRESS
+        ))
+
+    def testHandleRejectHoldingRegistersOutsideAddressSpace(self):
+        """reject a register range which ends beyond the Modbus address space"""
+        slave = modbus_tk.modbus.Slave(0, allow_adjacent_blocks=True)
+        slave.add_block("hr", modbus_tk.defines.HOLDING_REGISTERS, 65535, 1)
+
+        response = slave.handle_request(struct.pack(
+            ">BHH", modbus_tk.defines.READ_HOLDING_REGISTERS, 65535, 2
+        ))
+
+        self.assertEqual(response, struct.pack(
+            ">BB", modbus_tk.defines.READ_HOLDING_REGISTERS + 128, modbus_tk.defines.ILLEGAL_DATA_ADDRESS
+        ))
+
+    def testHandleWriteHoldingRegistersDoesNotPartiallyCommitInvalidRange(self):
+        """validate the complete register range before committing any block"""
+        slave = modbus_tk.modbus.Slave(0, allow_adjacent_blocks=True)
+        slave.add_block("hr-0", modbus_tk.defines.HOLDING_REGISTERS, 0, 3)
+        slave.add_block("hr-1", modbus_tk.defines.HOLDING_REGISTERS, 3, 4)
+        slave.add_block("hr-2", modbus_tk.defines.COILS, 7, 3)
+        slave.set_values("hr-0", 0, (11, 12, 13))
+        slave.set_values("hr-1", 3, (21, 22, 23, 24))
+
+        response = slave.handle_request(struct.pack(
+            ">BHHBHHHHHH", modbus_tk.defines.WRITE_MULTIPLE_REGISTERS,
+            2, 6, 12, 101, 102, 103, 104, 105, 106
+        ))
+
+        self.assertEqual(response, struct.pack(
+            ">BB", modbus_tk.defines.WRITE_MULTIPLE_REGISTERS + 128, modbus_tk.defines.ILLEGAL_DATA_ADDRESS
+        ))
+        self.assertEqual(slave.get_values("hr-0", 0, 3), (11, 12, 13))
+        self.assertEqual(slave.get_values("hr-1", 3, 4), (21, 22, 23, 24))
+
 
 class TestSlaveBlocks(unittest.TestCase):
     def setUp(self):

@@ -428,13 +428,15 @@ class Master(object):
 class ModbusBlock(object):
     """This class represents the values for a range of addresses"""
 
-    def __init__(self, starting_address, size, name=''):
+    def __init__(self, starting_address, size, name='', block_type=None):
         """
         Contructor: defines the address range and creates the array of values
         """
         self.starting_address = starting_address
         self._data = [0] * size
         self.size = len(self._data)
+        self.name = name
+        self.block_type = block_type
 
     def is_in(self, starting_address, size):
         """
@@ -463,7 +465,7 @@ class Slave(object):
     asked by a modbus query
     """
 
-    def __init__(self, slave_id, unsigned=True, memory=None):
+    def __init__(self, slave_id, unsigned=True, memory=None, allow_adjacent_blocks=False):
         """Constructor"""
         self._id = slave_id
 
@@ -484,6 +486,8 @@ class Slave(object):
             self._memory = memory
         # a lock for mutual access to the _blocks and _memory maps
         self._data_lock = threading.RLock()
+        # allow requests to read from or write to blocks with adjacent addresses
+        self.allow_adjacent_blocks = allow_adjacent_blocks
         # map modbus function code to a function:
         self._fn_code_map = {
             defines.READ_COILS: self._read_coils,
@@ -501,11 +505,46 @@ class Slave(object):
 
     def _get_block_and_offset(self, block_type, address, length):
         """returns the block and offset corresponding to the given address"""
-        for block in self._memory[block_type]:
+        for block in sorted(self._memory[block_type], key=lambda item: item.starting_address):
+            if getattr(block, "block_type", block_type) != block_type:
+                continue
             if address >= block.starting_address:
                 offset = address - block.starting_address
                 if block.size >= offset + length:
                     return block, offset
+        raise ModbusError(defines.ILLEGAL_DATA_ADDRESS)
+
+    def _get_block_ranges(self, block_type, address, length):
+        """returns the blocks covering an address range"""
+        if (address < 0) or (length <= 0) or ((address + length) > 65536):
+            raise ModbusError(defines.ILLEGAL_DATA_ADDRESS)
+
+        if not self.allow_adjacent_blocks:
+            block, offset = self._get_block_and_offset(block_type, address, length)
+            return ((block, offset, length), )
+
+        ranges = []
+        current_address = address
+        remaining_length = length
+
+        for block in sorted(self._memory[block_type], key=lambda item: item.starting_address):
+            if getattr(block, "block_type", block_type) != block_type:
+                continue
+            block_end = block.starting_address + block.size
+            if block_end <= current_address:
+                continue
+            if block.starting_address > current_address:
+                break
+
+            offset = current_address - block.starting_address
+            count = min(remaining_length, block.size - offset)
+            ranges.append((block, offset, count))
+
+            current_address += count
+            remaining_length -= count
+            if remaining_length == 0:
+                return ranges
+
         raise ModbusError(defines.ILLEGAL_DATA_ADDRESS)
 
     def _read_digital(self, block_type, request_pdu):
@@ -516,9 +555,11 @@ class Slave(object):
             # maximum allowed size is 2000 bits in one reading
             raise ModbusError(defines.ILLEGAL_DATA_VALUE)
 
-        block, offset = self._get_block_and_offset(block_type, starting_address, quantity_of_x)
+        ranges = self._get_block_ranges(block_type, starting_address, quantity_of_x)
 
-        values = block[offset:offset+quantity_of_x]
+        values = []
+        for block, offset, count in ranges:
+            values.extend(block[offset:offset+count])
 
         # pack bits in bytes
         byte_count = quantity_of_x // 8
@@ -565,11 +606,13 @@ class Slave(object):
             LOGGER.debug("quantity_of_x is %d", quantity_of_x)
             raise ModbusError(defines.ILLEGAL_DATA_VALUE)
 
-        # look for the block corresponding to the request
-        block, offset = self._get_block_and_offset(block_type, starting_address, quantity_of_x)
+        # look for the blocks corresponding to the request
+        ranges = self._get_block_ranges(block_type, starting_address, quantity_of_x)
 
         # get the values
-        values = block[offset:offset+quantity_of_x]
+        values = []
+        for block, offset, count in ranges:
+            values.extend(block[offset:offset+count])
 
         # write the response header
         response = struct.pack(">B", 2 * quantity_of_x)
@@ -607,31 +650,39 @@ class Slave(object):
             LOGGER.debug("quantity_of_x_to_read is %d", quantity_of_x_to_read)
             raise ModbusError(defines.ILLEGAL_DATA_VALUE)
 
-        # look for the block corresponding to the request
-        block, offset = self._get_block_and_offset(defines.HOLDING_REGISTERS, starting_read_address, quantity_of_x_to_read)
+        # write part
+        if (quantity_of_x_to_write <= 0) or (quantity_of_x_to_write > 123) or (byte_count_to_write != (quantity_of_x_to_write * 2)):
+            # maximum allowed size is 123 registers in one reading
+            raise ModbusError(defines.ILLEGAL_DATA_VALUE)
 
-        # get the values
-        values = block[offset:offset+quantity_of_x_to_read]
+        read_ranges = self._get_block_ranges(
+            defines.HOLDING_REGISTERS, starting_read_address, quantity_of_x_to_read
+        )
+        write_ranges = self._get_block_ranges(
+            defines.HOLDING_REGISTERS, starting_write_address, quantity_of_x_to_write
+        )
+
+        values_to_write = []
+        for i in range(quantity_of_x_to_write):
+            fmt = "H" if self.unsigned else "h"
+            values_to_write.append(struct.unpack(">"+fmt, request_pdu[10+2*i:12+2*i])[0])
+
+        value_index = 0
+        for block, offset, count in write_ranges:
+            block[offset:offset+count] = values_to_write[value_index:value_index+count]
+            value_index += count
+
+        # get the read values after the write has been committed
+        values = []
+        for block, offset, count in read_ranges:
+            values.extend(block[offset:offset+count])
+
         # write the response header
         response = struct.pack(">B", 2 * quantity_of_x_to_read)
         # add the values of every register on 2 bytes
         for reg in values:
             fmt = "H" if self.unsigned else "h"
             response += struct.pack(">"+fmt, reg)
-
-        # write part
-        if (quantity_of_x_to_write <= 0) or (quantity_of_x_to_write > 123) or (byte_count_to_write != (quantity_of_x_to_write * 2)):
-            # maximum allowed size is 123 registers in one reading
-            raise ModbusError(defines.ILLEGAL_DATA_VALUE)
-
-        # look for the block corresponding to the request
-        block, offset = self._get_block_and_offset(defines.HOLDING_REGISTERS, starting_write_address, quantity_of_x_to_write)
-
-        count = 0
-        for i in range(quantity_of_x_to_write):
-            count += 1
-            fmt = "H" if self.unsigned else "h"
-            block[offset+i] = struct.unpack(">"+fmt, request_pdu[10+2*i:12+2*i])[0]
 
         return response
 
@@ -641,7 +692,7 @@ class Slave(object):
 
         (data_address, and_mask, or_mask) = struct.unpack(">HHH", request_pdu[1:7])
         # look for the block corresponding to the request
-        block, offset = self._get_block_and_offset(defines.HOLDING_REGISTERS, data_address, 1)
+        block, offset, _ = self._get_block_ranges(defines.HOLDING_REGISTERS, data_address, 1)[0]
         block[offset] = (block[offset] & and_mask) | (or_mask & ~and_mask)
         # returns echo of the command
         return request_pdu[1:]
@@ -656,16 +707,18 @@ class Slave(object):
             # maximum allowed size is 123 registers in one reading
             raise ModbusError(defines.ILLEGAL_DATA_VALUE)
 
-        # look for the block corresponding to the request
-        block, offset = self._get_block_and_offset(defines.HOLDING_REGISTERS, starting_address, quantity_of_x)
-
-        count = 0
+        ranges = self._get_block_ranges(defines.HOLDING_REGISTERS, starting_address, quantity_of_x)
+        values = []
         for i in range(quantity_of_x):
-            count += 1
             fmt = "H" if self.unsigned else "h"
-            block[offset+i] = struct.unpack(">"+fmt, request_pdu[6+2*i:8+2*i])[0]
+            values.append(struct.unpack(">"+fmt, request_pdu[6+2*i:8+2*i])[0])
 
-        return struct.pack(">HH", starting_address, count)
+        value_index = 0
+        for block, offset, count in ranges:
+            block[offset:offset+count] = values[value_index:value_index+count]
+            value_index += count
+
+        return struct.pack(">HH", starting_address, quantity_of_x)
 
     def _write_multiple_coils(self, request_pdu):
         """execute modbus function 15"""
@@ -681,26 +734,21 @@ class Slave(object):
             # maximum allowed size is 1968 coils
             raise ModbusError(defines.ILLEGAL_DATA_VALUE)
 
-        # look for the block corresponding to the request
-        block, offset = self._get_block_and_offset(defines.COILS, starting_address, quantity_of_x)
+        ranges = self._get_block_ranges(defines.COILS, starting_address, quantity_of_x)
 
-        count = 0
-        for i in range(byte_count):
-            if count >= quantity_of_x:
-                break
+        values = []
+        for i in range(quantity_of_x):
             fmt = "B" if self.unsigned else "b"
-            (byte_value, ) = struct.unpack(">"+fmt, request_pdu[6+i:7+i])
-            for j in range(8):
-                if count >= quantity_of_x:
-                    break
+            byte_index = 6 + (i // 8)
+            (byte_value, ) = struct.unpack(">"+fmt, request_pdu[byte_index:byte_index+1])
+            values.append(1 if (byte_value & (1 << (i % 8))) else 0)
 
-                if byte_value & (1 << j):
-                    block[offset+i*8+j] = 1
-                else:
-                    block[offset+i*8+j] = 0
+        value_index = 0
+        for block, offset, count in ranges:
+            block[offset:offset+count] = values[value_index:value_index+count]
+            value_index += count
 
-                count += 1
-        return struct.pack(">HH", starting_address, count)
+        return struct.pack(">HH", starting_address, quantity_of_x)
 
     def _write_single_register(self, request_pdu):
         """execute modbus function 6"""
@@ -708,7 +756,7 @@ class Slave(object):
 
         fmt = "H" if self.unsigned else "h"
         (data_address, value) = struct.unpack(">H"+fmt, request_pdu[1:5])
-        block, offset = self._get_block_and_offset(defines.HOLDING_REGISTERS, data_address, 1)
+        block, offset, _ = self._get_block_ranges(defines.HOLDING_REGISTERS, data_address, 1)[0]
         block[offset] = value
         # returns echo of the command
         return request_pdu[1:]
@@ -718,7 +766,7 @@ class Slave(object):
 
         call_hooks("modbus.Slave.handle_write_single_coil_request", (self, request_pdu))
         (data_address, value) = struct.unpack(">HH", request_pdu[1:5])
-        block, offset = self._get_block_and_offset(defines.COILS, data_address, 1)
+        block, offset, _ = self._get_block_ranges(defines.COILS, data_address, 1)[0]
         if value == 0:
             block[offset] = 0
         elif value == 0xff00:
@@ -806,7 +854,9 @@ class Slave(object):
             # if the block is ok: register it
             self._blocks[block_name] = (block_type, starting_address)
             # add it in the 'per type' shortcut
-            self._memory[block_type].insert(index, ModbusBlock(starting_address, size, block_name))
+            self._memory[block_type].insert(
+                index, ModbusBlock(starting_address, size, block_name, block_type)
+            )
 
     def remove_block(self, block_name):
         """
@@ -905,13 +955,15 @@ class Databank(object):
         self._lock = threading.RLock()
         self.error_on_missing_slave = error_on_missing_slave
 
-    def add_slave(self, slave_id, unsigned=True, memory=None):
+    def add_slave(self, slave_id, unsigned=True, memory=None, allow_adjacent_blocks=False):
         """Add a new slave with the given id"""
         with self._lock:
             if (slave_id <= 0) or (slave_id > 255):
                 raise Exception("Invalid slave id {0}".format(slave_id))
             if slave_id not in self._slaves:
-                self._slaves[slave_id] = Slave(slave_id, unsigned, memory)
+                self._slaves[slave_id] = Slave(
+                    slave_id, unsigned, memory, allow_adjacent_blocks=allow_adjacent_blocks
+                )
                 return self._slaves[slave_id]
             else:
                 raise DuplicatedKeyError("Slave {0} already exists".format(slave_id))
@@ -1025,9 +1077,11 @@ class Server(object):
         """returns the databank"""
         return self._databank
 
-    def add_slave(self, slave_id, unsigned=True, memory=None):
+    def add_slave(self, slave_id, unsigned=True, memory=None, allow_adjacent_blocks=False):
         """add slave to the server"""
-        return self._databank.add_slave(slave_id, unsigned, memory)
+        return self._databank.add_slave(
+            slave_id, unsigned, memory, allow_adjacent_blocks=allow_adjacent_blocks
+        )
 
     def get_slave(self, slave_id):
         """get the slave with the given id"""
