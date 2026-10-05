@@ -16,7 +16,7 @@ import struct
 import logging
 import time
 import sys
-from modbus_tk.hooks import install_hook
+from modbus_tk.hooks import install_hook, uninstall_hook
 
 LOGGER = modbus_tk.utils.create_logger("udp")
 
@@ -172,6 +172,139 @@ class TestSlaveRequestHandler(unittest.TestCase):
         for reading discrete inputs at an address shared on distinct blocks
         """
         self._read_continuous_blocks(modbus_tk.defines.READ_INPUT_REGISTERS, modbus_tk.defines.ANALOG_INPUTS)
+
+    def _read_write_request(self, read_address, read_quantity, write_address, write_values, byte_count=None):
+        if byte_count is None:
+            byte_count = 2 * len(write_values)
+        request = struct.pack(
+            ">BHHHHB",
+            modbus_tk.defines.READ_WRITE_MULTIPLE_REGISTERS,
+            read_address, read_quantity, write_address, len(write_values), byte_count
+        )
+        for value in write_values:
+            fmt = "H" if value >= 0 else "h"
+            request += struct.pack(">"+fmt, value)
+        return request
+
+    def _read_write_response(self, values):
+        response = struct.pack(">BB", modbus_tk.defines.READ_WRITE_MULTIPLE_REGISTERS, 2*len(values))
+        for value in values:
+            fmt = "H" if value >= 0 else "h"
+            response += struct.pack(">"+fmt, value)
+        return response
+
+    def testHandleReadWriteMultipleRegistersOverlap(self):
+        """write range is committed before the overlapping read response is built"""
+        self._slave.add_block(self._name, modbus_tk.defines.HOLDING_REGISTERS, 10, 10)
+        self._slave.set_values(self._name, 10, tuple(range(10, 20)))
+
+        response = self._slave.handle_request(
+            self._read_write_request(10, 5, 12, (100, 200))
+        )
+
+        self.assertEqual(response, self._read_write_response((10, 11, 100, 200, 14)))
+        self.assertEqual(
+            self._slave.get_values(self._name, 10, 10),
+            (10, 11, 100, 200, 14, 15, 16, 17, 18, 19)
+        )
+
+    def testHandleReadWriteMultipleRegistersDifferentBlocks(self):
+        """read and write ranges are resolved against their own blocks"""
+        self._slave.add_block("write-block", modbus_tk.defines.HOLDING_REGISTERS, 0, 10)
+        self._slave.add_block("read-block", modbus_tk.defines.HOLDING_REGISTERS, 20, 10)
+        self._slave.set_values("read-block", 20, tuple(range(100, 110)))
+
+        response = self._slave.handle_request(
+            self._read_write_request(20, 10, 0, (1, 2, 3))
+        )
+
+        self.assertEqual(response, self._read_write_response(tuple(range(100, 110))))
+        self.assertEqual(self._slave.get_values("write-block", 0, 10), (1, 2, 3, 0, 0, 0, 0, 0, 0, 0))
+        self.assertEqual(self._slave.get_values("read-block", 20, 10), tuple(range(100, 110)))
+
+    def testHandleReadWriteMultipleRegistersSigned(self):
+        """signed register values survive write and overlapping read"""
+        slave = modbus_tk.modbus.Slave(0, unsigned=False)
+        slave.add_block(self._name, modbus_tk.defines.HOLDING_REGISTERS, 0, 10)
+        slave.set_values(self._name, 0, (-3, -4, -5, -6, -7))
+
+        response = slave.handle_request(
+            self._read_write_request(0, 5, 1, (-1, -2))
+        )
+
+        self.assertEqual(response, self._read_write_response((-3, -1, -2, -6, -7)))
+        self.assertEqual(slave.get_values(self._name, 0, 5), (-3, -1, -2, -6, -7))
+
+    def testHandleReadWriteMultipleRegistersHookOrder(self):
+        """write hooks observe each register before the post-write read response"""
+        self._slave.add_block(self._name, modbus_tk.defines.HOLDING_REGISTERS, 10, 10)
+        self._slave.set_values(self._name, 10, tuple(range(10, 20)))
+        events = []
+        block = self._slave._get_block(self._name)
+
+        def request_hook(args):
+            events.append(("request", args[1]))
+
+        def setitem_hook(args):
+            hooked_block, item, value = args
+            if hooked_block is block:
+                events.append(("write", block.starting_address + item, value, block[0:5]))
+
+        install_hook("modbus.Slave.handle_read_write_multiple_registers_request", request_hook)
+        install_hook("modbus.ModbusBlock.setitem", setitem_hook)
+        self.addCleanup(uninstall_hook, "modbus.Slave.handle_read_write_multiple_registers_request", request_hook)
+        self.addCleanup(uninstall_hook, "modbus.ModbusBlock.setitem", setitem_hook)
+
+        request = self._read_write_request(10, 5, 12, (100, 200))
+        response = self._slave.handle_request(request)
+
+        self.assertEqual(response, self._read_write_response((10, 11, 100, 200, 14)))
+        self.assertEqual(events, [
+            ("request", request),
+            ("write", 12, 100, [10, 11, 12, 13, 14]),
+            ("write", 13, 200, [10, 11, 100, 13, 14]),
+        ])
+
+    def testHandleReadWriteMultipleRegistersAtLimits(self):
+        """accept 125 read registers and 121 write registers"""
+        self._slave.add_block(self._name, modbus_tk.defines.HOLDING_REGISTERS, 0, 125)
+        self._slave.set_values(self._name, 0, tuple(range(125)))
+        write_values = tuple(range(1000, 1121))
+
+        response = self._slave.handle_request(
+            self._read_write_request(0, 125, 0, write_values)
+        )
+
+        expected_values = write_values + tuple(range(121, 125))
+        self.assertEqual(response, self._read_write_response(expected_values))
+        self.assertEqual(self._slave.get_values(self._name, 0, 125), expected_values)
+
+    def testHandleInvalidReadWriteMultipleRegistersDoesNotWrite(self):
+        """malformed or out-of-range FC23 requests return an error and preserve the block"""
+        self._slave.add_block(self._name, modbus_tk.defines.HOLDING_REGISTERS, 0, 128)
+        self._slave.set_values(self._name, 0, tuple(range(128)))
+        block_before = tuple(self._slave._get_block(self._name)[:])
+        valid_values = (1, 2)
+        invalid_requests = [
+            (struct.pack(">BHH", 23, 0, 1), modbus_tk.defines.ILLEGAL_DATA_VALUE),
+            (self._read_write_request(0, 0, 0, valid_values), modbus_tk.defines.ILLEGAL_DATA_VALUE),
+            (self._read_write_request(0, 126, 0, valid_values), modbus_tk.defines.ILLEGAL_DATA_VALUE),
+            (self._read_write_request(0, 1, 0, ()), modbus_tk.defines.ILLEGAL_DATA_VALUE),
+            (self._read_write_request(0, 1, 0, tuple(range(122))), modbus_tk.defines.ILLEGAL_DATA_VALUE),
+            (self._read_write_request(0, 1, 0, valid_values, byte_count=2), modbus_tk.defines.ILLEGAL_DATA_VALUE),
+            (self._read_write_request(0, 1, 0, valid_values, byte_count=6), modbus_tk.defines.ILLEGAL_DATA_VALUE),
+            (self._read_write_request(0, 1, 0, valid_values)[:-1], modbus_tk.defines.ILLEGAL_DATA_VALUE),
+            (self._read_write_request(0, 1, 0, valid_values) + struct.pack(">H", 3), modbus_tk.defines.ILLEGAL_DATA_VALUE),
+            (self._read_write_request(127, 2, 0, valid_values), modbus_tk.defines.ILLEGAL_DATA_ADDRESS),
+            (self._read_write_request(0, 1, 127, valid_values), modbus_tk.defines.ILLEGAL_DATA_ADDRESS),
+        ]
+
+        for request, exception_code in invalid_requests:
+            self.assertEqual(
+                self._slave.handle_request(request),
+                struct.pack(">BB", 128+23, exception_code)
+            )
+            self.assertEqual(tuple(self._slave._get_block(self._name)[:]), block_before)
 
 
 class TestSlaveBlocks(unittest.TestCase):

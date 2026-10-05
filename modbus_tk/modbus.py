@@ -598,41 +598,49 @@ class Slave(object):
     def _read_write_multiple_registers(self, request_pdu):
         """execute modbus function 23"""
         call_hooks("modbus.Slave.handle_read_write_multiple_registers_request", (self, request_pdu))
-        # get the starting address and the number of items from the request pdu
-        (starting_read_address, quantity_of_x_to_read, starting_write_address, quantity_of_x_to_write, byte_count_to_write) = struct.unpack(">HHHHB", request_pdu[1:10])
+        if len(request_pdu) < 10:
+            raise ModbusError(defines.ILLEGAL_DATA_VALUE)
 
-        # read part
+        # get the starting address and the number of items from the request pdu
+        (
+            starting_read_address, quantity_of_x_to_read,
+            starting_write_address, quantity_of_x_to_write, byte_count_to_write
+        ) = struct.unpack(">HHHHB", request_pdu[1:10])
+
         if (quantity_of_x_to_read <= 0) or (quantity_of_x_to_read > 125):
-            # maximum allowed size is 125 registers in one reading
             LOGGER.debug("quantity_of_x_to_read is %d", quantity_of_x_to_read)
             raise ModbusError(defines.ILLEGAL_DATA_VALUE)
 
-        # look for the block corresponding to the request
-        block, offset = self._get_block_and_offset(defines.HOLDING_REGISTERS, starting_read_address, quantity_of_x_to_read)
-
-        # get the values
-        values = block[offset:offset+quantity_of_x_to_read]
-        # write the response header
-        response = struct.pack(">B", 2 * quantity_of_x_to_read)
-        # add the values of every register on 2 bytes
-        for reg in values:
-            fmt = "H" if self.unsigned else "h"
-            response += struct.pack(">"+fmt, reg)
-
-        # write part
-        if (quantity_of_x_to_write <= 0) or (quantity_of_x_to_write > 123) or (byte_count_to_write != (quantity_of_x_to_write * 2)):
-            # maximum allowed size is 123 registers in one reading
+        if (quantity_of_x_to_write <= 0) or (quantity_of_x_to_write > 121):
             raise ModbusError(defines.ILLEGAL_DATA_VALUE)
 
-        # look for the block corresponding to the request
-        block, offset = self._get_block_and_offset(defines.HOLDING_REGISTERS, starting_write_address, quantity_of_x_to_write)
+        expected_request_length = 10 + 2 * quantity_of_x_to_write
+        if (
+            (byte_count_to_write != 2 * quantity_of_x_to_write)
+            or (len(request_pdu) != expected_request_length)
+        ):
+            raise ModbusError(defines.ILLEGAL_DATA_VALUE)
 
-        count = 0
-        for i in range(quantity_of_x_to_write):
-            count += 1
-            fmt = "H" if self.unsigned else "h"
-            block[offset+i] = struct.unpack(">"+fmt, request_pdu[10+2*i:12+2*i])[0]
+        # Resolve both ranges before modifying data so invalid requests cannot partially write.
+        read_block, read_offset = self._get_block_and_offset(
+            defines.HOLDING_REGISTERS, starting_read_address, quantity_of_x_to_read
+        )
+        write_block, write_offset = self._get_block_and_offset(
+            defines.HOLDING_REGISTERS, starting_write_address, quantity_of_x_to_write
+        )
 
+        fmt = "H" if self.unsigned else "h"
+        write_values = struct.unpack(
+            ">"+fmt*quantity_of_x_to_write, request_pdu[10:expected_request_length]
+        )
+
+        for i, value in enumerate(write_values):
+            write_block[write_offset+i] = value
+
+        values = read_block[read_offset:read_offset+quantity_of_x_to_read]
+        response = struct.pack(">B", 2 * quantity_of_x_to_read)
+        for reg in values:
+            response += struct.pack(">"+fmt, reg)
         return response
 
     def _mask_write_register(self, request_pdu):
