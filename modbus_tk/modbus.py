@@ -80,11 +80,12 @@ class Master(object):
     To be subclassed with a class implementing the MAC layer
     """
 
-    def __init__(self, timeout_in_sec, hooks=None):
-        """Constructor: can define a timeout"""
+    def __init__(self, timeout_in_sec, hooks=None, strict=False):
+        """Constructor: can define a timeout and enable strict response validation"""
         self._timeout = timeout_in_sec
         self._verbose = False
         self._is_opened = False
+        self._strict = strict
 
     def __del__(self):
         """Destructor: close the connection"""
@@ -93,6 +94,22 @@ class Master(object):
     def set_verbose(self, verbose):
         """print some more log prints for debug purpose"""
         self._verbose = verbose
+
+    def set_strict(self, strict):
+        """
+        Enable or disable strict response validation.
+        If strict is True, the response of the slave is checked against the request
+        before any value is returned by execute: the function code, the address and
+        value echoed by single write functions, the address and quantity echoed by
+        multiple write functions, the byte count of read functions and the function
+        code of exception responses must match the request. A mismatch raises a
+        ModbusInvalidResponseError while a valid exception response raises a ModbusError.
+        """
+        self._strict = strict
+
+    def get_strict(self):
+        """Returns True if strict response validation is enabled"""
+        return self._strict
 
     def open(self):
         """open the communication with the slave"""
@@ -151,6 +168,13 @@ class Master(object):
         of one long (by the number of requested sub_seq)
         the result will be
         ((sub _ seq_0 _ data), (sub_seq_1_data),... (sub_seq_N_data)).
+        If strict mode is enabled (see set_strict), the response is checked against
+        the request actually sent on the bus (hooks may have modified it) before any
+        value is returned, including when returns_raw is True. For RAW requests using
+        a custom function code, only the function code correspondence (normal and
+        exception responses) is checked, the content of the response being
+        user-defined. Broadcast queries (slave 0) do not expect any response and
+        return None.
         """
 
         is_read_function = False
@@ -351,13 +375,23 @@ class Master(object):
         retval = call_hooks("modbus.Master.before_send", (self, request))
         if retval is not None:
             request = retval
+
+        # a response is expected from the slave except for broadcast queries
+        response_expected = (slave is not None) and (slave != 0)
+
+        if self._strict and response_expected:
+            # strict mode: extract the pdu of the request as it is actually sent
+            # (a hook may have modified it) so that the response can be checked
+            # against it
+            (_, request_pdu) = query.parse_request(request)
+
         if self._verbose:
             LOGGER.debug(get_log_buffer("-> ", request))
         self._send(request)
 
         call_hooks("modbus.Master.after_send", (self, ))
 
-        if slave is not None:
+        if response_expected:
             # receive the data from the slave
             response = self._recv(expected_length)
             retval = call_hooks("modbus.Master.after_recv", (self, response))
@@ -368,6 +402,11 @@ class Master(object):
 
             # extract the pdu part of the response
             response_pdu = query.parse_response(response)
+
+            if self._strict:
+                # strict mode: the response must match the request before
+                # anything is returned to the caller
+                self._validate_response(request_pdu, response_pdu)
 
             # analyze the received data
             (return_code, byte_2) = struct.unpack(">BB", response_pdu[0:2])
@@ -415,6 +454,85 @@ class Master(object):
                         ptr += result[ptr] // 2 + 2
                     result = tuple(map(lambda sub_seq_x: result[sub_seq_x[0]:sub_seq_x[1]], sub_seq))
                 return result
+
+    @staticmethod
+    def _validate_response(request_pdu, response_pdu):
+        """
+        Strict mode: check that the response pdu matches the request pdu.
+        Raise a ModbusInvalidResponseError if it is not the case.
+        An exception response whose function code corresponds to the request is
+        considered valid here: the exception itself is handled by the caller
+        which raises a ModbusError.
+        For requests with a custom function code (RAW), only the function code
+        correspondence is checked as the response content is user-defined.
+        """
+        if (not request_pdu) or (not response_pdu):
+            raise ModbusInvalidResponseError("Request or response pdu is empty. ")
+
+        (request_function_code, ) = struct.unpack(">B", request_pdu[0:1])
+        (response_function_code, ) = struct.unpack(">B", response_pdu[0:1])
+
+        if response_function_code > 0x80:
+            # exception response: the function code must correspond to the request one
+            if response_function_code != (request_function_code | 0x80):
+                raise ModbusInvalidResponseError(
+                    "Exception response function code {0} does not match request function code {1}. ".format(
+                        response_function_code, request_function_code
+                    )
+                )
+            return
+
+        if response_function_code != request_function_code:
+            raise ModbusInvalidResponseError(
+                "Response function code {0} does not match request function code {1}. ".format(
+                    response_function_code, request_function_code
+                )
+            )
+
+        if request_function_code in (
+            defines.WRITE_SINGLE_COIL, defines.WRITE_SINGLE_REGISTER,
+            defines.WRITE_MULTIPLE_COILS, defines.WRITE_MULTIPLE_REGISTERS
+        ):
+            # the slave echoes the starting address and the value (single write)
+            # or the quantity of written items (multiple write) of the request
+            if (len(request_pdu) < 5) or (len(response_pdu) < 5) or (response_pdu[1:5] != request_pdu[1:5]):
+                raise ModbusInvalidResponseError(
+                    "Write echo {0} does not match request {1}. ".format(
+                        get_log_buffer("", response_pdu[1:5]), get_log_buffer("", request_pdu[1:5])
+                    )
+                )
+        elif request_function_code in (defines.READ_COILS, defines.READ_DISCRETE_INPUTS):
+            # the byte count of the response must match the requested quantity of bits
+            if len(response_pdu) < 2:
+                raise ModbusInvalidResponseError("Response pdu is too short. ")
+            if len(request_pdu) >= 5:
+                (quantity_of_x, ) = struct.unpack(">H", request_pdu[3:5])
+                expected_byte_count = quantity_of_x // 8
+                if (quantity_of_x % 8) > 0:
+                    expected_byte_count += 1
+                (response_byte_count, ) = struct.unpack(">B", response_pdu[1:2])
+                if response_byte_count != expected_byte_count:
+                    raise ModbusInvalidResponseError(
+                        "Byte count is {0} while {1} bytes are expected for {2} bits. ".format(
+                            response_byte_count, expected_byte_count, quantity_of_x
+                        )
+                    )
+        elif request_function_code in (
+            defines.READ_HOLDING_REGISTERS, defines.READ_INPUT_REGISTERS,
+            defines.READ_WRITE_MULTIPLE_REGISTERS
+        ):
+            # the byte count of the response must match the requested quantity of registers
+            if len(response_pdu) < 2:
+                raise ModbusInvalidResponseError("Response pdu is too short. ")
+            if len(request_pdu) >= 5:
+                (quantity_of_x, ) = struct.unpack(">H", request_pdu[3:5])
+                (response_byte_count, ) = struct.unpack(">B", response_pdu[1:2])
+                if response_byte_count != 2 * quantity_of_x:
+                    raise ModbusInvalidResponseError(
+                        "Byte count is {0} while {1} bytes are expected for {2} registers. ".format(
+                            response_byte_count, 2 * quantity_of_x, quantity_of_x
+                        )
+                    )
 
     def set_timeout(self, timeout_in_sec):
         """Defines a timeout on the MAC layer"""
