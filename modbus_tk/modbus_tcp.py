@@ -155,9 +155,13 @@ class TcpQuery(Query):
 class TcpMaster(Master):
     """Subclass of Master. Implements the Modbus TCP MAC layer"""
 
-    def __init__(self, host="127.0.0.1", port=502, timeout_in_sec=5.0):
-        """Constructor. Set the communication settings"""
+    def __init__(self, host="127.0.0.1", port=502, timeout_in_sec=5.0, strict=False):
+        """Constructor. Set the communication settings.
+        If strict is True, every response is strictly validated against the
+        request which has been sent (see Master.set_strict_response_validation)
+        """
         super(TcpMaster, self).__init__(timeout_in_sec)
+        self.set_strict_response_validation(strict)
         self._host = host
         self._port = port
         self._sock = None

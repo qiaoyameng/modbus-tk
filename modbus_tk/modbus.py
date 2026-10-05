@@ -84,6 +84,9 @@ class Master(object):
         """Constructor: can define a timeout"""
         self._timeout = timeout_in_sec
         self._verbose = False
+        # when True every response is strictly checked against the request
+        # which has actually been sent (see _validate_response_pdu)
+        self._strict_response_validation = False
         self._is_opened = False
 
     def __del__(self):
@@ -93,6 +96,39 @@ class Master(object):
     def set_verbose(self, verbose):
         """print some more log prints for debug purpose"""
         self._verbose = verbose
+
+    def set_strict_response_validation(self, is_strict):
+        """
+        Enable/disable the strict validation of responses.
+
+        When strict validation is enabled, the master checks that every
+        response matches the request which was actually sent before any
+        business value is returned (and even when returns_raw is True):
+          - the MAC layer checks done by the query (transaction id for TCP,
+            slave address/CRC for RTU) always apply,
+          - the function code of an exception response is the function code
+            of the request (with the 0x80 bit set),
+          - for a normal response the function code is the function code of
+            the request,
+          - for READ_COILS and READ_DISCRETE_INPUTS the byte count is equal
+            to the number of bytes needed to carry the requested quantity,
+          - for READ_INPUT_REGISTERS, READ_HOLDING_REGISTERS and
+            READ_WRITE_MULTIPLE_REGISTERS the byte count is twice the
+            requested quantity,
+          - for WRITE_SINGLE_COIL/REGISTER the address and value echo the
+            request,
+          - for WRITE_MULTIPLE_COILS/REGISTERS the address and quantity echo
+            the request,
+          - for MASK_WRITE_REGISTER the address, and mask and or mask echo
+            the request.
+        A mismatch raises ModbusInvalidResponseError (a protocol mismatch),
+        while a well formed exception response raises ModbusError (a device
+        exception).
+        For unknown/custom RAW requests only the MAC layer checks and the
+        function code checks apply: the structure of a custom payload is not
+        known so its content cannot be interpreted.
+        """
+        self._strict_response_validation = bool(is_strict)
 
     def open(self):
         """open the communication with the slave"""
@@ -357,7 +393,23 @@ class Master(object):
 
         call_hooks("modbus.Master.after_send", (self, ))
 
+        # a request sent to slave id 0 is a broadcast: no response is expected.
+        # RAW requests are excluded: the caller owns the frame semantics.
+        if slave == 0 and function_code != defines.RAW:
+            return None
+
         if slave is not None:
+            # The request which has actually been sent may have been changed by
+            # the modbus.Master.before_send hook. Parse it back so that the
+            # strict validation is done against the final request on the wire.
+            try:
+                (_, sent_pdu) = query.parse_request(request)
+            except Exception:
+                # the MAC layer is unable to parse back the hooked frame
+                # (e.g. an RTU hook rewrote the pdu without updating the CRC):
+                # fall back on the pdu which has been built
+                sent_pdu = pdu
+
             # receive the data from the slave
             response = self._recv(expected_length)
             retval = call_hooks("modbus.Master.after_recv", (self, response))
@@ -368,6 +420,12 @@ class Master(object):
 
             # extract the pdu part of the response
             response_pdu = query.parse_response(response)
+
+            if self._strict_response_validation:
+                # make sure that the pdu is an answer to the request actually
+                # sent before interpreting any business value. Done even when
+                # returns_raw is True.
+                self._validate_response_pdu(sent_pdu, response_pdu)
 
             # analyze the received data
             (return_code, byte_2) = struct.unpack(">BB", response_pdu[0:2])
@@ -415,6 +473,109 @@ class Master(object):
                         ptr += result[ptr] // 2 + 2
                     result = tuple(map(lambda sub_seq_x: result[sub_seq_x[0]:sub_seq_x[1]], sub_seq))
                 return result
+
+    def _validate_response_pdu(self, request_pdu, response_pdu):
+        """
+        Strictly check that the response PDU answers the request PDU which has
+        actually been sent. Raise ModbusInvalidResponseError on any protocol
+        mismatch. A well-formed exception response is NOT a protocol mismatch:
+        it is raised afterwards as a ModbusError by execute().
+
+        For unknown/custom RAW requests only the function code checks apply
+        (and the MAC layer checks done while parsing the response) because the
+        layout of a custom payload cannot be interpreted.
+        """
+        if len(request_pdu) < 1 or len(response_pdu) < 2:
+            raise ModbusInvalidResponseError(
+                "PDU is too short to be validated: request is {0} byte(s), response is {1} byte(s).".format(
+                    len(request_pdu), len(response_pdu)
+                )
+            )
+
+        (request_function_code,) = struct.unpack(">B", request_pdu[0:1])
+        (response_function_code, byte_2) = struct.unpack(">BB", response_pdu[0:2])
+
+        # the function code of an exception response is the request function
+        # code with the most significant bit set. Nothing else can be checked
+        # on an exception response.
+        if response_function_code & 0x80:
+            if response_function_code != (request_function_code | 0x80):
+                raise ModbusInvalidResponseError(
+                    "Exception response function code {0} doesn't match request function code {1}.".format(
+                        response_function_code, request_function_code
+                    )
+                )
+            return
+
+        if response_function_code != request_function_code:
+            raise ModbusInvalidResponseError(
+                "Response function code {0} is different from request function code {1}.".format(
+                    response_function_code, request_function_code
+                )
+            )
+
+        if request_function_code in (defines.READ_COILS, defines.READ_DISCRETE_INPUTS):
+            # bytes needed to carry the requested quantity of bits
+            (_, quantity_of_x) = struct.unpack(">HH", request_pdu[1:5])
+            expected_byte_count = quantity_of_x // 8 + (1 if quantity_of_x % 8 else 0)
+            if byte_2 != expected_byte_count:
+                raise ModbusInvalidResponseError(
+                    "Byte count is {0} while {1} byte(s) is/are required for {2} {3}.".format(
+                        byte_2, expected_byte_count, quantity_of_x,
+                        "coils" if request_function_code == defines.READ_COILS else "discrete inputs"
+                    )
+                )
+
+        elif request_function_code in (
+            defines.READ_INPUT_REGISTERS, defines.READ_HOLDING_REGISTERS,
+            defines.READ_WRITE_MULTIPLE_REGISTERS
+        ):
+            # the quantity of registers to read is the 3rd field of the request
+            (_, quantity_of_x) = struct.unpack(">HH", request_pdu[1:5])
+            expected_byte_count = 2 * quantity_of_x
+            if byte_2 != expected_byte_count:
+                raise ModbusInvalidResponseError(
+                    "Byte count is {0} while it should be {1} for {2} register(s).".format(
+                        byte_2, expected_byte_count, quantity_of_x
+                    )
+                )
+
+        elif request_function_code in (defines.WRITE_SINGLE_COIL, defines.WRITE_SINGLE_REGISTER):
+            # the whole request (address + value) must be echoed back
+            if response_pdu[1:] != request_pdu[1:]:
+                raise ModbusInvalidResponseError(
+                    "Write echo {0} doesn't match request {1}.".format(
+                        get_log_buffer("", response_pdu[1:]), get_log_buffer("", request_pdu[1:])
+                    )
+                )
+
+        elif request_function_code in (defines.WRITE_MULTIPLE_COILS, defines.WRITE_MULTIPLE_REGISTERS):
+            # address and quantity must be echoed back
+            (request_address, request_quantity) = struct.unpack(">HH", request_pdu[1:5])
+            if len(response_pdu) < 5:
+                raise ModbusInvalidResponseError(
+                    "Response of write multiple request is only {0} byte(s) long.".format(len(response_pdu))
+                )
+            (response_address, response_quantity) = struct.unpack(">HH", response_pdu[1:5])
+            if response_address != request_address or response_quantity != request_quantity:
+                raise ModbusInvalidResponseError(
+                    "Write echo address/quantity is {0}/{1} while request is {2}/{3}.".format(
+                        response_address, response_quantity, request_address, request_quantity
+                    )
+                )
+
+        elif request_function_code == defines.MASK_WRITE_REGISTER:
+            # address, and mask and or mask must be echoed back
+            if response_pdu[1:] != request_pdu[1:]:
+                raise ModbusInvalidResponseError(
+                    "Mask write echo {0} doesn't match request {1}.".format(
+                        get_log_buffer("", response_pdu[1:]), get_log_buffer("", request_pdu[1:])
+                    )
+                )
+
+        # for every other function code (READ_FILE_RECORD, READ_EXCEPTION_STATUS,
+        # DIAGNOSTIC, DEVICE_INFO and unknown/custom RAW requests) nothing more
+        # than the function code can be checked generically
 
     def set_timeout(self, timeout_in_sec):
         """Defines a timeout on the MAC layer"""

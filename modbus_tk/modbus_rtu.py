@@ -85,12 +85,16 @@ class RtuQuery(Query):
 class RtuMaster(Master):
     """Subclass of Master. Implements the Modbus RTU MAC layer"""
 
-    def __init__(self, serial, interchar_multiplier=1.5, interframe_multiplier=3.5, t0=None):
-        """Constructor. Pass the pyserial.Serial object"""
+    def __init__(self, serial, interchar_multiplier=1.5, interframe_multiplier=3.5, t0=None, strict=False):
+        """Constructor. Pass the pyserial.Serial object.
+        If strict is True, every response is strictly validated against the
+        request which has been sent (see Master.set_strict_response_validation)
+        """
         self._serial = serial
         self.use_sw_timeout = False
         LOGGER.debug("RtuMaster %s is %s", self._serial.name, "opened" if self._serial.is_open else "closed")
         super(RtuMaster, self).__init__(self._serial.timeout)
+        self.set_strict_response_validation(strict)
 
         if t0:
             self._t0 = t0
